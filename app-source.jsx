@@ -5,6 +5,7 @@ import {
   getAuth,
   onAuthStateChanged,
   signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
   sendPasswordResetEmail,
   signOut,
 } from "firebase/auth";
@@ -18,6 +19,7 @@ import {
   query,
   where,
   onSnapshot,
+  getDoc,
   setDoc,
   updateDoc,
   deleteDoc,
@@ -25,7 +27,7 @@ import {
   serverTimestamp,
 } from "firebase/firestore";
 
-const APP_VERSION = "2.0";
+const APP_VERSION = "2.1";
 
 /* ------------------------------------------------------------------ */
 /*  FIREBASE                                                           */
@@ -99,7 +101,24 @@ function authErrorText(err) {
   if (code.includes("too-many-requests")) return "Příliš mnoho pokusů. Zkus to za pár minut znovu.";
   if (code.includes("network-request-failed")) return "Nepodařilo se připojit. Zkontroluj internet.";
   if (code.includes("user-disabled")) return "Tento účet je zablokovaný.";
+  if (code.includes("email-already-in-use")) return "Tenhle e-mail už je zaregistrovaný. Zkus se rovnou přihlásit.";
+  if (code.includes("weak-password")) return "Heslo musí mít aspoň 6 znaků.";
   return "Něco se nepovedlo. Zkus to znovu.";
+}
+
+async function sha256Hex(text) {
+  const bytes = new TextEncoder().encode(text.trim());
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function checkInviteCode(code) {
+  const snap = await getDoc(doc(db, "config", "invite"));
+  if (!snap.exists() || !snap.data().codeHash) {
+    throw new Error("invite-not-configured");
+  }
+  const hash = await sha256Hex(code);
+  return hash === snap.data().codeHash;
 }
 
 function shuffle(arr) {
@@ -685,63 +704,142 @@ function LoginScreen() {
   const [mode, setMode] = useState("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [password2, setPassword2] = useState("");
+  const [invite, setInvite] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [info, setInfo] = useState("");
+  const lastSubmit = useRef(0);
+
+  const switchMode = (next) => {
+    setMode(next);
+    setError("");
+    setInfo("");
+    setPassword("");
+    setPassword2("");
+    setInvite("");
+  };
 
   const submit = async (e) => {
     e.preventDefault();
     setError("");
     setInfo("");
+
+    // light throttle so a mistyped invite code can't be hammered against Firestore
+    const now = Date.now();
+    if (now - lastSubmit.current < 1200) return;
+    lastSubmit.current = now;
+
     const mail = email.trim();
     if (!mail) { setError("Vyplň e-mail."); return; }
-    if (mode === "login" && !password) { setError("Vyplň heslo."); return; }
+
+    if (mode === "reset") {
+      setBusy(true);
+      try {
+        await sendPasswordResetEmail(auth, mail);
+        setInfo("Pokud účet s tímto e-mailem existuje, poslali jsme na něj odkaz pro nastavení hesla. Zkontroluj i složku se spamem.");
+      } catch (err) {
+        setError(authErrorText(err));
+      }
+      setBusy(false);
+      return;
+    }
+
+    if (!password) { setError("Vyplň heslo."); return; }
+
+    if (mode === "login") {
+      setBusy(true);
+      try {
+        await signInWithEmailAndPassword(auth, mail, password);
+      } catch (err) {
+        setError(authErrorText(err));
+      }
+      setBusy(false);
+      return;
+    }
+
+    // mode === "register"
+    if (password.length < 6) { setError("Heslo musí mít aspoň 6 znaků."); return; }
+    if (password !== password2) { setError("Hesla se neshodují."); return; }
+    if (!invite.trim()) { setError("Vyplň zvací kód."); return; }
     setBusy(true);
     try {
-      if (mode === "login") {
-        await signInWithEmailAndPassword(auth, mail, password);
-        return;
-      }
-      await sendPasswordResetEmail(auth, mail);
-      setInfo("Pokud účet s tímto e-mailem existuje, poslali jsme na něj odkaz pro nastavení hesla. Zkontroluj i složku se spamem.");
+      const ok = await checkInviteCode(invite);
+      if (!ok) { setError("Neplatný zvací kód."); setBusy(false); return; }
+      await createUserWithEmailAndPassword(auth, mail, password);
     } catch (err) {
-      setError(authErrorText(err));
+      if (err && err.message === "invite-not-configured") {
+        setError("Registrace teď není dostupná. Zkus to prosím později.");
+      } else {
+        setError(authErrorText(err));
+      }
     }
     setBusy(false);
+  };
+
+  const titles = {
+    login: "Přihlas se a tvůj pokrok se bude ukládat na všech tvých zařízeních.",
+    reset: "Pošleme ti e-mail s odkazem, přes který si nastavíš nové heslo.",
+    register: "Vytvoř si účet zvacím kódem, který jsi dostal od kolegy.",
+  };
+  const buttonLabels = {
+    login: "Přihlásit se",
+    reset: "Poslat odkaz",
+    register: "Vytvořit účet",
   };
 
   return (
     <div className="tf-shell tf-login">
       <header className="tf-hero">
         <h1>Turbine English</h1>
-        <p>
-          {mode === "login"
-            ? "Přihlas se a tvůj pokrok se bude ukládat na všech tvých zařízeních."
-            : "Pošleme ti e-mail s odkazem, přes který si nastavíš nové heslo."}
-        </p>
+        <p>{titles[mode]}</p>
       </header>
       <form onSubmit={submit} noValidate>
         <label className="tf-field">
           <span className="tf-label">E-mail</span>
           <input className="tf-input" type="email" autoComplete="username" inputMode="email" value={email} onChange={(e) => setEmail(e.target.value)} />
         </label>
-        {mode === "login" && (
+        {mode !== "reset" && (
           <label className="tf-field">
             <span className="tf-label">Heslo</span>
-            <input className="tf-input" type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} />
+            <input
+              className="tf-input"
+              type="password"
+              autoComplete={mode === "register" ? "new-password" : "current-password"}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
           </label>
+        )}
+        {mode === "register" && (
+          <>
+            <label className="tf-field">
+              <span className="tf-label">Heslo znovu</span>
+              <input className="tf-input" type="password" autoComplete="new-password" value={password2} onChange={(e) => setPassword2(e.target.value)} />
+            </label>
+            <label className="tf-field">
+              <span className="tf-label">Zvací kód</span>
+              <input className="tf-input" value={invite} onChange={(e) => setInvite(e.target.value)} />
+              <span className="tf-hint">Kód dostaneš od kolegy, který aplikaci používá.</span>
+            </label>
+          </>
         )}
         {error && <p className="tf-error" role="alert">{error}</p>}
         {info && <p className="tf-ok" role="status">{info}</p>}
         <button type="submit" className="tf-btn tf-btn-flip" style={{ width: "100%" }} disabled={busy}>
-          {busy ? "Chvilku…" : mode === "login" ? "Přihlásit se" : "Poslat odkaz"}
+          {busy ? "Chvilku…" : buttonLabels[mode]}
         </button>
       </form>
       <div className="tf-stack">
-        <button type="button" className="tf-link" onClick={() => { setMode(mode === "login" ? "reset" : "login"); setError(""); setInfo(""); }}>
-          {mode === "login" ? "Zapomenuté heslo" : "Zpět na přihlášení"}
-        </button>
-        <p className="tf-hint">Účet ti založí ten, kdo ti aplikaci poslal. Heslo si pak nastavíš sám přes „Zapomenuté heslo“.</p>
+        {mode === "login" && (
+          <>
+            <button type="button" className="tf-link" onClick={() => switchMode("reset")}>Zapomenuté heslo</button>
+            <button type="button" className="tf-link" onClick={() => switchMode("register")}>Nemáš účet? Vytvořit účet</button>
+          </>
+        )}
+        {mode !== "login" && (
+          <button type="button" className="tf-link" onClick={() => switchMode("login")}>Zpět na přihlášení</button>
+        )}
       </div>
       <p className="tf-version">Verze {APP_VERSION}</p>
     </div>

@@ -1,7 +1,7 @@
 // Turbine English – offline support.
 // Online: always loads the newest files from the server (so updates arrive automatically).
 // Offline: falls back to the last saved copy.
-const CACHE = "turbine-english-v2.0";
+const CACHE = "turbine-english-v2.1";
 const SHELL = ["./", "index.html", "app.js", "manifest.webmanifest", "icon-180.png", "icon-192.png", "icon-512.png"];
 
 self.addEventListener("install", (event) => {
