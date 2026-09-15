@@ -27,7 +27,7 @@ import {
   serverTimestamp,
 } from "firebase/firestore";
 
-const APP_VERSION = "2.2";
+const APP_VERSION = "2.3";
 
 /* ------------------------------------------------------------------ */
 /*  FIREBASE                                                           */
@@ -70,6 +70,58 @@ try {
 const LEGACY_KEY = "turbine-flashcards-v1";        // progress saved by version 1.0 on this device
 const LEGACY_DONE_KEY = "turbine-legacy-migrated";
 const DIR_KEY = "turbine-direction";
+const SPEECH_KEY = "turbine-speech-settings";
+
+/* ------------------------------------------------------------------ */
+/*  SPEECH                                                             */
+/* ------------------------------------------------------------------ */
+
+const speechSettings = { accent: "us", rate: 0.9 };
+try {
+  const raw = typeof window !== "undefined" && window.localStorage && localStorage.getItem(SPEECH_KEY);
+  if (raw) Object.assign(speechSettings, JSON.parse(raw));
+} catch (e) {
+  /* defaults are fine */
+}
+
+function saveSpeechSettings() {
+  try { localStorage.setItem(SPEECH_KEY, JSON.stringify(speechSettings)); } catch (e) { /* ignore */ }
+}
+
+// Voices load asynchronously on some browsers (notably Chrome), so cache
+// them once and keep the cache fresh via the voiceschanged event.
+let cachedVoices = [];
+if (typeof window !== "undefined" && "speechSynthesis" in window) {
+  const synth = window.speechSynthesis;
+  const refreshVoices = () => { cachedVoices = synth.getVoices(); };
+  refreshVoices();
+  synth.onvoiceschanged = refreshVoices;
+}
+
+// Browsers expose many voices of wildly different quality under generic
+// names. Score them so we consistently pick the most natural-sounding one
+// instead of whatever the platform lists first.
+function scoreVoice(v, accentLang) {
+  let score = 0;
+  const lang = (v.lang || "").toLowerCase();
+  if (lang === accentLang.toLowerCase()) score += 10;
+  else if (lang.startsWith("en")) score += 4;
+  const name = (v.name || "").toLowerCase();
+  if (/natural|neural|premium|enhanced|studio/.test(name)) score += 8;
+  if (/online/.test(name)) score += 5;
+  if (/google/.test(name)) score += 4;
+  if (/samantha|daniel|karen|moira|tessa|aaron|nicky|ava|matthew|joanna/.test(name)) score += 3;
+  if (/microsoft/.test(name)) score += 2;
+  if (/compact|espeak|robot|zira|david/.test(name)) score -= 5;
+  if (v.localService === false) score += 1;
+  return score;
+}
+
+function pickVoice(accentLang) {
+  const candidates = cachedVoices.filter((v) => (v.lang || "").toLowerCase().startsWith("en"));
+  if (!candidates.length) return null;
+  return [...candidates].sort((a, b) => scoreVoice(b, accentLang) - scoreVoice(a, accentLang))[0];
+}
 
 function readLegacyProgress() {
   try {
@@ -137,10 +189,10 @@ function speak(text) {
     synth.cancel();
     const clean = text.replace(/…/g, "").replace(/\(.*?\)/g, "").replace(/\//g, " or ");
     const u = new SpeechSynthesisUtterance(clean);
-    u.lang = "en-US";
-    u.rate = 0.9;
-    const voices = synth.getVoices();
-    const voice = voices.find((v) => v.lang === "en-US") || voices.find((v) => v.lang && v.lang.startsWith("en"));
+    const accentLang = speechSettings.accent === "uk" ? "en-GB" : "en-US";
+    u.lang = accentLang;
+    u.rate = speechSettings.rate;
+    const voice = pickVoice(accentLang);
     if (voice) u.voice = voice;
     synth.speak(u);
   } catch (e) {
@@ -2702,6 +2754,9 @@ export default function App() {
   const [direction, setDirection] = useState(() => {
     try { return localStorage.getItem(DIR_KEY) || "en-cz"; } catch (e) { return "en-cz"; }
   });
+  const [accent, setAccent] = useState(speechSettings.accent);
+  const [rate, setRate] = useState(speechSettings.rate);
+  const [voicePreview, setVoicePreview] = useState("idle");
   const [online, setOnline] = useState(() => (typeof navigator === "undefined" ? true : navigator.onLine !== false));
   const [syncError, setSyncError] = useState(false);
 
@@ -2933,6 +2988,24 @@ export default function App() {
     setDirection(d);
     try { localStorage.setItem(DIR_KEY, d); } catch (e) { /* ignore */ }
     if (uid) setDoc(doc(db, "users", uid), { direction: d }, { merge: true }).catch((e) => console.error(e));
+  };
+
+  const changeAccent = (a) => {
+    speechSettings.accent = a;
+    setAccent(a);
+    saveSpeechSettings();
+  };
+
+  const changeRate = (r) => {
+    speechSettings.rate = r;
+    setRate(r);
+    saveSpeechSettings();
+  };
+
+  const previewVoice = () => {
+    setVoicePreview("playing");
+    speak("This is what the pronunciation will sound like.");
+    setTimeout(() => setVoicePreview("idle"), 2500);
   };
 
   const openDeck = (id) => {
@@ -3436,6 +3509,26 @@ export default function App() {
           <button type="button" role="radio" aria-checked={direction === "en-cz"} onClick={() => changeDirection("en-cz")}>EN → CZ</button>
           <button type="button" role="radio" aria-checked={direction === "cz-en"} onClick={() => changeDirection("cz-en")}>CZ → EN</button>
         </div>
+      </div>
+
+      <div className="tf-setting">
+        <span className="tf-setting-label">Přízvuk</span>
+        <div className="tf-seg" role="radiogroup" aria-label="Přízvuk výslovnosti">
+          <button type="button" role="radio" aria-checked={accent === "us"} onClick={() => changeAccent("us")}>Americký</button>
+          <button type="button" role="radio" aria-checked={accent === "uk"} onClick={() => changeAccent("uk")}>Britský</button>
+        </div>
+      </div>
+
+      <div className="tf-setting">
+        <span className="tf-setting-label">Rychlost</span>
+        <div className="tf-seg" role="radiogroup" aria-label="Rychlost výslovnosti">
+          <button type="button" role="radio" aria-checked={rate === 0.75} onClick={() => changeRate(0.75)}>Pomalu</button>
+          <button type="button" role="radio" aria-checked={rate === 0.9} onClick={() => changeRate(0.9)}>Normálně</button>
+          <button type="button" role="radio" aria-checked={rate === 1.05} onClick={() => changeRate(1.05)}>Rychleji</button>
+        </div>
+        <button type="button" className="tf-link" style={{ padding: "6px 0" }} onClick={previewVoice} disabled={voicePreview === "playing"}>
+          {voicePreview === "playing" ? "Přehrávám…" : "Vyzkoušet hlas"}
+        </button>
       </div>
 
       <div className="tf-actions">
